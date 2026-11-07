@@ -1,0 +1,316 @@
+do $$
+declare
+  constraint_name text;
+begin
+  if to_regclass('public.products') is not null then
+    alter table public.products
+      add column if not exists price_cents integer,
+      add column if not exists stock_count integer,
+      add column if not exists status text,
+      add column if not exists image_url text,
+      add column if not exists artisan_name text,
+      add column if not exists category text,
+      add column if not exists description text,
+      add column if not exists created_at timestamptz;
+
+    drop policy if exists "Anyone can view published products"
+      on public.products;
+    drop policy if exists "Visitors can view available published products"
+      on public.products;
+
+    for constraint_name in
+      select conname
+      from pg_constraint
+      where conrelid = 'public.products'::regclass
+        and contype = 'c'
+        and pg_get_constraintdef(oid) ilike '%status%'
+    loop
+      execute format(
+        'alter table public.products drop constraint %I',
+        constraint_name
+      );
+    end loop;
+
+    alter table public.products
+      alter column status drop default,
+      alter column status type text using status::text,
+      alter column category drop default,
+      alter column category type text using category::text;
+
+    if exists (
+      select 1 from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'products'
+        and column_name = 'price'
+    ) then
+      execute '
+        update public.products
+        set price_cents = round(price::numeric * 100)::integer
+        where price_cents is null and price is not null
+      ';
+    end if;
+
+    if exists (
+      select 1 from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'products'
+        and column_name = 'stock'
+    ) then
+      execute '
+        update public.products
+        set stock_count = greatest(stock::integer, 0)
+        where stock_count is null and stock is not null
+      ';
+    end if;
+
+    if exists (
+      select 1 from information_schema.columns
+      where table_schema = 'public'
+        and table_name = 'products'
+        and column_name = 'image'
+    ) then
+      execute '
+        update public.products
+        set image_url = image::text
+        where image_url is null and image is not null
+      ';
+    end if;
+
+    update public.products
+    set stock_count = coalesce(stock_count, 0),
+        status = case
+          when status in ('published', 'archived') then status
+          else 'draft'
+        end,
+        image_url = coalesce(image_url, ''),
+        artisan_name = coalesce(nullif(artisan_name, ''), 'Independent artisan'),
+        category = coalesce(nullif(category, ''), 'Handmade'),
+        description = coalesce(description, ''),
+        created_at = coalesce(created_at, now());
+
+    if exists (
+      select 1 from public.products
+      where price_cents is null or price_cents <= 0
+    ) then
+      raise exception
+        'Could not migrate products: set a positive price in the existing products.price column for every product, then rerun this migration';
+    end if;
+
+    alter table public.products
+      alter column price_cents set not null,
+      alter column stock_count set default 0,
+      alter column stock_count set not null,
+      alter column status set default 'draft',
+      alter column status set not null,
+      alter column image_url set default '',
+      alter column image_url set not null,
+      alter column artisan_name set default 'Independent artisan',
+      alter column artisan_name set not null,
+      alter column category set default 'Handmade',
+      alter column category set not null,
+      alter column description set default '',
+      alter column description set not null,
+      alter column created_at set default now(),
+      alter column created_at set not null;
+
+    if not exists (
+      select 1 from pg_constraint
+      where conrelid = 'public.products'::regclass
+        and conname = 'products_price_cents_check'
+    ) then
+      alter table public.products
+        add constraint products_price_cents_check check (price_cents > 0);
+    end if;
+
+    if not exists (
+      select 1 from pg_constraint
+      where conrelid = 'public.products'::regclass
+        and conname = 'products_stock_count_check'
+    ) then
+      alter table public.products
+        add constraint products_stock_count_check check (stock_count >= 0);
+    end if;
+
+    if not exists (
+      select 1 from pg_constraint
+      where conrelid = 'public.products'::regclass
+        and conname = 'products_status_check'
+    ) then
+      alter table public.products
+        add constraint products_status_check
+        check (status in ('draft', 'published', 'archived'));
+    end if;
+  end if;
+end;
+$$;
+
+create table if not exists public.products (
+  id bigint generated by default as identity primary key,
+  name text not null check (length(name) between 2 and 120),
+  price_cents integer not null check (price_cents > 0),
+  stock_count integer not null default 0 check (stock_count >= 0),
+  status text not null default 'draft' check (status in ('draft', 'published', 'archived')),
+  image_url text not null,
+  artisan_name text not null,
+  category text not null,
+  description text not null,
+  created_at timestamptz not null default now()
+);
+
+alter table public.products enable row level security;
+
+create policy "Visitors can view available published products"
+  on public.products for select
+  to anon, authenticated
+  using (status = 'published' and stock_count > 0);
+
+create table if not exists public.orders (
+  id uuid primary key default gen_random_uuid(),
+  stripe_session_id text not null unique,
+  customer_email text not null,
+  customer_name text not null,
+  amount_total_cents integer not null check (amount_total_cents > 0),
+  currency text not null check (currency = 'usd'),
+  shipping_address jsonb not null default '{}'::jsonb,
+  status text not null default 'paid' check (status in ('paid', 'needs_review')),
+  created_at timestamptz not null default now()
+);
+
+create table if not exists public.order_items (
+  id bigint generated always as identity primary key,
+  order_id uuid not null references public.orders(id) on delete restrict,
+  product_id bigint references public.products(id) on delete set null,
+  product_name text not null,
+  unit_price_cents integer not null check (unit_price_cents > 0),
+  quantity integer not null check (quantity > 0),
+  created_at timestamptz not null default now()
+);
+
+create index if not exists order_items_order_id_idx
+  on public.order_items(order_id);
+
+alter table public.orders enable row level security;
+alter table public.order_items enable row level security;
+
+create or replace function public.fulfill_paid_order(
+  p_session_id text,
+  p_customer_email text,
+  p_customer_name text,
+  p_amount_total_cents integer,
+  p_currency text,
+  p_shipping_address jsonb,
+  p_items jsonb
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_order_id uuid;
+  v_item jsonb;
+  v_product public.products%rowtype;
+  v_product_id bigint;
+  v_quantity integer;
+  v_status text := 'paid';
+begin
+  if p_session_id is null or length(p_session_id) > 255
+    or p_customer_email is null or length(p_customer_email) > 254
+    or p_customer_name is null or length(p_customer_name) > 100
+    or p_amount_total_cents is null or p_amount_total_cents <= 0
+    or p_currency is distinct from 'usd'
+    or jsonb_typeof(p_items) is distinct from 'array'
+    or jsonb_array_length(p_items) < 1
+    or jsonb_array_length(p_items) > 20
+  then
+    raise exception 'Invalid paid order data';
+  end if;
+
+  insert into public.orders (
+    stripe_session_id,
+    customer_email,
+    customer_name,
+    amount_total_cents,
+    currency,
+    shipping_address
+  )
+  values (
+    p_session_id,
+    p_customer_email,
+    p_customer_name,
+    p_amount_total_cents,
+    p_currency,
+    coalesce(p_shipping_address, '{}'::jsonb)
+  )
+  on conflict (stripe_session_id) do nothing
+  returning id into v_order_id;
+
+  if v_order_id is null then
+    select id into v_order_id
+    from public.orders
+    where stripe_session_id = p_session_id;
+    return v_order_id;
+  end if;
+
+  for v_item in
+    select value
+    from jsonb_array_elements(p_items)
+    order by (value ->> 'product_id')::bigint
+  loop
+    v_product_id := (v_item ->> 'product_id')::bigint;
+    v_quantity := (v_item ->> 'quantity')::integer;
+
+    if v_product_id is null or v_quantity is null
+      or v_quantity < 1 or v_quantity > 10
+    then
+      raise exception 'Invalid paid order item';
+    end if;
+
+    select * into v_product
+    from public.products
+    where id = v_product_id
+    for update;
+
+    if not found then
+      v_status := 'needs_review';
+    elsif v_product.status <> 'published'
+      or v_product.stock_count < v_quantity
+    then
+      v_status := 'needs_review';
+    else
+      update public.products
+      set stock_count = stock_count - v_quantity
+      where id = v_product_id;
+    end if;
+
+    insert into public.order_items (
+      order_id,
+      product_id,
+      product_name,
+      unit_price_cents,
+      quantity
+    )
+    values (
+      v_order_id,
+      case when found then v_product_id else null end,
+      left(coalesce(v_item ->> 'product_name', 'Handmade product'), 120),
+      (v_item ->> 'unit_price_cents')::integer,
+      v_quantity
+    );
+  end loop;
+
+  update public.orders
+  set status = v_status
+  where id = v_order_id;
+
+  return v_order_id;
+end;
+$$;
+
+revoke all on function public.fulfill_paid_order(
+  text, text, text, integer, text, jsonb, jsonb
+) from public, anon, authenticated;
+
+grant execute on function public.fulfill_paid_order(
+  text, text, text, integer, text, jsonb, jsonb
+) to service_role;
